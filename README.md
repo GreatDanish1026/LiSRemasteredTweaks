@@ -1,4 +1,4 @@
-# LiSRemasteredTweaks 0.2.0
+# LiSRemasteredTweaks 1.0.0
 
 Graphics add-on for **Life is Strange Remastered** (PC, Steam), for ReShade with add-on support.
 Raises the game's lighting, shadow and detail settings beyond what its menu offers and adds HDR
@@ -7,8 +7,8 @@ output, live, from an in-game overlay.
 - **HDR**: the game's menu has no HDR option. The HDR tab keeps Deck Nine's colour grade: the
   game renders as usual and the add-on turns the finished picture into HDR10, stretching only
   the brightest parts, with **Peak brightness** and **Paper white** sliders (and a button that
-  uses the peak Windows reports for your display). Windows HDR must be on. Unreal's own HDR
-  output isn't offered: it drops the grade (cooler, paler, lifted shadows).
+  uses the peak Windows reports for your display). Windows HDR must be on. Tested on DirectX 12.
+  Unreal's own HDR output isn't offered: it drops the grade (cooler, paler, lifted shadows).
 - **Lighting**: reflections on rougher surfaces, finer lighting on translucent effects. The
   menu's highest setting already maxes reflection quality, ambient occlusion and volumetric fog.
 - **Shadows**: 4096 / 8192 shadow maps, longer shadow distance, contact-hardening shadows,
@@ -46,5 +46,7 @@ folder (game closed).
 
 Ported from TrueColorsTweaks (UE 4.25). Everything goes through the game's console variables, set
 on the game thread (from the console manager's once-per-frame sinks call), at console priority;
-letting go puts the game's value and priority back. `docs/FINDINGS.md` has the UE 4.23 layout and
-what the game ships.
+letting go puts the game's value and priority back. HDR is a full-screen pass the add-on draws at
+each present, before ReShade's effects and overlay (`src/hdr.hlsl`, compiled with the Windows SDK's
+`fxc` by `build.ps1`). `docs/FINDINGS.md` has the UE 4.23 layout, what the game ships and the HDR
+measurements.
