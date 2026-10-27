@@ -149,6 +149,8 @@ constexpr const char* kHdrTab = "HDR";               // in no preset, not measur
 constexpr int kPeakMin = 400, kPeakMax = 4000, kPaperMin = 80, kPaperMax = 400;
 int g_hdrPeak = 1000;
 int g_hdrPaper = 200;
+constexpr int kStartMin = 40, kStartMax = 90;
+int g_hdrStart = 50;  // % of SDR white (as encoded) where the highlight stretch starts
 
 // Every cvar here exists in this exe (checked offline against its strings). The game's values
 // and costs are filled in from the first probe and measurements (docs/FINDINGS.md).
@@ -1092,7 +1094,9 @@ bool RunGradedPass(command_queue* queue, swapchain* sc, float paperWhite, float 
     }
     cmd->bind_pipeline(pipeline_stage::all_graphics, g_pass.pipe);
     // knee 0.6, gamma 2.2 decode, UI mask, debug view (Advanced tab)
-    const float params[8] = {paperWhite, peak, 0.6f, 2.2f, uiMask ? 1.0f : 0.0f, static_cast<float>(g_hdrDebugView), 0, 0};
+    // The knee is in linear light: the slider's share of SDR white, decoded with gamma 2.2.
+    const float knee = std::pow(g_hdrStart / 100.0f, 2.2f);
+    const float params[8] = {paperWhite, peak, knee, 2.2f, uiMask ? 1.0f : 0.0f, static_cast<float>(g_hdrDebugView), 0, 0};
     cmd->push_constants(shader_stage::pixel, g_pass.layout, 0, 0, 8, params);
     const resource_view views[2] = {g_pass.copyView, g_pass.sceneView};
     descriptor_table_update update = {};
@@ -1243,8 +1247,8 @@ void HdrOnPresent(command_queue* queue, swapchain* sc) {
     if (ran && (!g_gradedActive || g_colorSpaceDirty)) {
         const bool ok = SetSwapchainColorSpace(sc, DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
         if (g_runtime) g_runtime->set_color_space(color_space::hdr10_pq);
-        Log("graded HDR on: swap chain HDR10 %s (paper white %d, peak %d nits)", ok ? "set" : "REFUSED", g_hdrPaper,
-            g_hdrPeak);
+        Log("graded HDR on: swap chain HDR10 %s (paper white %d, peak %d nits, highlights from %d%%)",
+            ok ? "set" : "REFUSED", g_hdrPaper, g_hdrPeak, g_hdrStart);
         g_hdrStatus = ok ? "HDR10" : "the display refused HDR10 (is Windows HDR on?)";
         g_gradedActive = true;
         g_colorSpaceDirty = false;
@@ -1560,11 +1564,24 @@ void DrawHdrSliders() {
     save |= ImGui::SliderInt("Paper white", &g_hdrPaper, kPaperMin, kPaperMax, "%d nits", ImGuiSliderFlags_AlwaysClamp);
     Help("How bright everything else is: walls, faces, the menus and subtitles. 200 is a\n"
          "common choice; raise it in a bright room, lower it in a dark one.");
+    ImGui::SetNextItemWidth(ControlWidth());
+    save |= ImGui::SliderInt("Highlights start at", &g_hdrStart, kStartMin, kStartMax, "%d%% of white",
+                             ImGuiSliderFlags_AlwaysClamp);
+    Help("Where the picture starts getting brighter than SDR. Below this, everything looks\n"
+         "exactly as the game graded it; above it, brightness rises towards the peak. The\n"
+         "game keeps many highlights (sun, snow, glare) at 80-85% of white, so a start below\n"
+         "that brightens them. Lower is punchier; higher stays closer to SDR. Default 50%.");
     if (g_hdrPeak < g_hdrPaper) ImGui::TextColored(kWarn, "Peak is below paper white: highlights aren't stretched.");
+    static bool unlogged = false;  // log once the slider is let go, not at every step
     if (save) {
         reshade::set_config_value(nullptr, DT_PRODUCT, "HdrPeak", g_hdrPeak);
         reshade::set_config_value(nullptr, DT_PRODUCT, "HdrPaperWhite", g_hdrPaper);
-        Log("graded HDR: peak %d, paper white %d nits", g_hdrPeak, g_hdrPaper);
+        reshade::set_config_value(nullptr, DT_PRODUCT, "HdrHighlightStart", g_hdrStart);
+        unlogged = true;
+    }
+    if (unlogged && !ImGui::IsAnyItemActive()) {
+        Log("graded HDR: peak %d, paper white %d nits, highlights from %d%%", g_hdrPeak, g_hdrPaper, g_hdrStart);
+        unlogged = false;
     }
 }
 
@@ -1823,6 +1840,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
             reshade::get_config_value(nullptr, DT_PRODUCT, "HdrPaperWhite", g_hdrPaper);
             g_hdrPeak = std::clamp(g_hdrPeak, kPeakMin, kPeakMax);
             g_hdrPaper = std::clamp(g_hdrPaper, kPaperMin, kPaperMax);
+            reshade::get_config_value(nullptr, DT_PRODUCT, "HdrHighlightStart", g_hdrStart);
+            g_hdrStart = std::clamp(g_hdrStart, kStartMin, kStartMax);
             reshade::register_event<reshade::addon_event::present>(&OnPresent);
             reshade::register_event<reshade::addon_event::init_effect_runtime>(&OnInitRuntime);
             reshade::register_event<reshade::addon_event::destroy_effect_runtime>(&OnDestroyRuntime);

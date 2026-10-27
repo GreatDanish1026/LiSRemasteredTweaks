@@ -14,7 +14,7 @@ cbuffer Params : register(b0)
 {
     float paperWhite;  // nits for SDR white (1.0)
     float peak;        // nits the brightest SDR white is stretched to (<= paperWhite: no stretch)
-    float knee;        // relative luminance where the stretch starts (0..1)
+    float knee;        // linear luminance where the stretch starts (0..1): the "Highlights start at" slider
     float gamma;       // decode: > 0 = power gamma, 0 = sRGB curve
     float uiMask;      // 1: t1 holds this frame before its UI; compare against it
     float debugView;   // 0 off, 1 tint UI pixels magenta, 2 show t1 (the scene-only copy)

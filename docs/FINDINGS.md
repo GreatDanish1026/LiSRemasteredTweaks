@@ -107,8 +107,22 @@ menu now peak at 202 nits (paper white 203) instead of the peak.
 
 On this title screen the sun and the sea glare reach only SDR code 0.80 (linear 0.60), right at
 the stretch's knee, so they aren't brightened either (about 120 nits): the grade keeps the
-scene's highlights below SDR white. LiS 2's snow showed the same. A knee lower than 0.6 (or a
-setting for it) would give such scenes highlights; not changed yet.
+scene's highlights below SDR white. LiS 2's snow showed the same: hence the slider below.
+
+### Highlights start at (slider, default 50%)
+
+The stretch used to start at a fixed 0.6 of SDR white in linear light (79% as encoded). Both
+games keep many highlights below that (Remastered's title-screen sun and sea glare at 80%,
+LiS 2's snow at 85%), so they barely brightened. The HDR tab now has a "Highlights start at"
+slider (40-90% of SDR white as encoded; the shader's knee is that share decoded with gamma 2.2),
+ini key HdrHighlightStart. Below it the picture is exactly as graded; above it the same quadratic
+rise lands SDR white on the peak.
+
+At peak 3700 and paper white 250 (SDR level -> nits): 50% 54 (unchanged), 60% 90, 70% 212,
+80% 595, 85% 980, 90% 1571, 95% 2445, 100% 3700. The old start gave 153 at 80% and 228 at 85%.
+User test on the Remastered title screen (2026-10-27): 40% "much brighter": it also lifts the
+bright mid-tones (a 70% sky 2.8x), drifting from the grade; 50% was chosen as the default. UI is
+excluded before the stretch, so menus stay at paper white at any setting.
 
 ## Preset costs
 
