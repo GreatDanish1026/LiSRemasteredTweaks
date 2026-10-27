@@ -92,7 +92,23 @@ white, highlight stretch above 0.6 of SDR white towards the peak, Rec. 2020, PQ)
 chain to HDR10 with SetColorSpace1 and tells ReShade (effect_runtime::set_color_space). First
 run 2026-10-27 14:30: pipeline built on DirectX 12 at 3840x2160, switching between modes clean,
 the display reports 3700 nits (DXGI_OUTPUT_DESC1). The user's verdict: looks good. UI is in the
-same image, so pure white text goes to the peak too.
+same image, so pure white text went to the peak too.
+
+### UI at paper white (1.1.0)
+
+Ported from LiS2Tweaks. Draw log (2026-10-27 19:05, DirectX 12, title screen): the scene renders
+into screen-sized float targets (format 10), then the back buffer is cleared, gets one
+full-screen `draw_indexed 3` (the tonemapper) and then the UI (6-index quads, 360/216-index
+text); three swap chain buffers drawn in turn. Same pattern as LiS 2, so the same rule: right
+before the second draw into a back buffer in a frame, the add-on copies it, and the HDR pass
+doesn't stretch pixels that differ from that copy. Copy and present on the same thread, of the
+same buffer (log). Tint view: exactly the logo, the menu and the scrolling text. The logo and
+menu now peak at 202 nits (paper white 203) instead of the peak.
+
+On this title screen the sun and the sea glare reach only SDR code 0.80 (linear 0.60), right at
+the stretch's knee, so they aren't brightened either (about 120 nits): the grade keeps the
+scene's highlights below SDR white. LiS 2's snow showed the same. A knee lower than 0.6 (or a
+setting for it) would give such scenes highlights; not changed yet.
 
 ## Preset costs
 

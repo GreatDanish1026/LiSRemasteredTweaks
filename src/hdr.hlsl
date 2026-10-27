@@ -3,8 +3,12 @@
 //
 // The SDR image is decoded with gamma 2.2 (how it looks on an SDR monitor) or the sRGB curve,
 // placed at the chosen paper white, and only its top end is stretched towards the chosen peak:
-// below the knee nothing changes, so the grade and the shadows stay as Deck Nine made them.
+// below the knee nothing changes, so the grade and the shadows stay as the game made them.
 // Hue is kept by scaling RGB together. Then Rec. 709 -> Rec. 2020 and the ST 2084 (PQ) curve.
+//
+// UI (menus, prompts, subtitles) is drawn into the same image after the game's picture, so the
+// add-on copies the frame just before the first UI draw (t1). Pixels that differ from that copy
+// were touched by the UI and aren't stretched: they stay at paper white.
 
 cbuffer Params : register(b0)
 {
@@ -12,9 +16,13 @@ cbuffer Params : register(b0)
     float peak;        // nits the brightest SDR white is stretched to (<= paperWhite: no stretch)
     float knee;        // relative luminance where the stretch starts (0..1)
     float gamma;       // decode: > 0 = power gamma, 0 = sRGB curve
+    float uiMask;      // 1: t1 holds this frame before its UI; compare against it
+    float debugView;   // 0 off, 1 tint UI pixels magenta, 2 show t1 (the scene-only copy)
+    float2 padding;
 };
 
-Texture2D<float4> source : register(t0);
+Texture2D<float4> source : register(t0);  // the finished frame
+Texture2D<float4> scene : register(t1);   // the same frame before the UI (when uiMask is 1)
 
 void main_vs(uint id : SV_VertexID, out float4 position : SV_Position)
 {
@@ -43,20 +51,28 @@ static const float3x3 kRec709ToRec2020 = {
 
 float4 main_ps(float4 position : SV_Position) : SV_Target
 {
-    const float3 c = saturate(source.Load(int3(position.xy, 0)).rgb);
+    const int3 p = int3(position.xy, 0);
+    const float3 c = debugView == 2 ? saturate(scene.Load(p).rgb) : saturate(source.Load(p).rgb);
     float3 rgb = gamma > 0 ? pow(c, gamma) : SrgbToLinear(c);
+
+    // Touched by the UI: differs from the scene-only copy by more than half a 10-bit step.
+    bool ui = false;
+    if (uiMask > 0)
+        ui = any(abs(c - saturate(scene.Load(p).rgb)) > 0.5 / 1023.0);
 
     // Highlight stretch on luminance: y -> knee + (y - knee) * (1 + s * t^2), t = (y - knee) / (1 - knee).
     // Continuous with slope 1 at the knee; SDR white (1.0) lands on peak / paperWhite.
     const float y = dot(rgb, float3(0.2126, 0.7152, 0.0722));
     const float top = peak / paperWhite;
-    if (top > 1 && y > knee)
+    if (!ui && top > 1 && y > knee)
     {
         const float t = (y - knee) / (1 - knee);
         const float stretched = knee + (y - knee) * (1 + (top - 1) / (1 - knee) * t * t);
         rgb *= stretched / max(y, 1e-5);
     }
 
+    if (debugView == 1 && ui)
+        rgb = lerp(rgb, float3(1, 0, 1), 0.6);
     const float3 rec2020 = mul(kRec709ToRec2020, rgb);
     return float4(LinearToPq(max(rec2020, 0) * paperWhite), 1);
 }

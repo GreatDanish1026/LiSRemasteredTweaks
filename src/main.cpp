@@ -955,6 +955,8 @@ struct GradedPass {
     format pipeFormat = format::unknown;
     resource copy = {0};
     resource_view copyView = {0};
+    resource scene = {0};  // the frame just before its first UI draw
+    resource_view sceneView = {0};
     uint32_t width = 0, height = 0;
     format copyFormat = format::unknown;
     std::map<uint64_t, resource_view> targets;  // back buffer -> render target view
@@ -968,8 +970,12 @@ void ReleaseTargets() {
     g_pass.targets.clear();
     if (g_pass.copyView.handle) dev->destroy_resource_view(g_pass.copyView);
     if (g_pass.copy.handle) dev->destroy_resource(g_pass.copy);
+    if (g_pass.sceneView.handle) dev->destroy_resource_view(g_pass.sceneView);
+    if (g_pass.scene.handle) dev->destroy_resource(g_pass.scene);
     g_pass.copyView = {0};
     g_pass.copy = {0};
+    g_pass.sceneView = {0};
+    g_pass.scene = {0};
     g_pass.width = g_pass.height = 0;
 }
 
@@ -984,8 +990,8 @@ void ReleasePass() {
 
 bool CreatePipeline(device* dev, format target) {
     pipeline_layout_param params[2];
-    params[0] = constant_range{0, 0, 0, 4, shader_stage::pixel};  // b0: 4 floats
-    params[1] = descriptor_range{0, 0, 0, 1, shader_stage::pixel, 1, descriptor_type::shader_resource_view};  // t0
+    params[0] = constant_range{0, 0, 0, 8, shader_stage::pixel};  // b0: 8 floats
+    params[1] = descriptor_range{0, 0, 0, 2, shader_stage::pixel, 1, descriptor_type::shader_resource_view};  // t0, t1
     if (!dev->create_pipeline_layout(2, params, &g_pass.layout)) return false;
     shader_desc vs = {};
     vs.code = kHdrVs;
@@ -1023,6 +1029,9 @@ bool EnsureTargets(device* dev, resource bb, const resource_desc& desc, resource
         if (!dev->create_resource(cd, nullptr, resource_usage::shader_resource_pixel, &g_pass.copy)) return false;
         if (!dev->create_resource_view(g_pass.copy, resource_usage::shader_resource, resource_view_desc(f), &g_pass.copyView))
             return false;
+        if (!dev->create_resource(cd, nullptr, resource_usage::shader_resource_pixel, &g_pass.scene)) return false;
+        if (!dev->create_resource_view(g_pass.scene, resource_usage::shader_resource, resource_view_desc(f), &g_pass.sceneView))
+            return false;
         g_pass.width = w, g_pass.height = h, g_pass.copyFormat = f;
     }
     auto it = g_pass.targets.find(bb.handle);
@@ -1035,8 +1044,12 @@ bool EnsureTargets(device* dev, resource bb, const resource_desc& desc, resource
     return true;
 }
 
+std::atomic<bool> g_inPass{false};  // our own commands: the draw tracking ignores them
+int g_hdrDebugView = 0;             // Advanced tab: 0 off, 1 tint UI, 2 show the scene-only copy
+
 // Draws the frame back into the back buffer as HDR10. Present thread, before ReShade's own work.
-bool RunGradedPass(command_queue* queue, swapchain* sc, float paperWhite, float peak) {
+// <uiMask>: g_pass.scene holds this frame before its UI.
+bool RunGradedPass(command_queue* queue, swapchain* sc, float paperWhite, float peak, bool uiMask) {
     device* dev = sc->get_device();
     const resource bb = sc->get_current_back_buffer();
     const resource_desc desc = dev->get_resource_desc(bb);
@@ -1062,6 +1075,7 @@ bool RunGradedPass(command_queue* queue, swapchain* sc, float paperWhite, float 
         g_pass.failed = true;
         return false;
     }
+    g_inPass = true;
     command_list* cmd = queue->get_immediate_command_list();
     {
         const resource res[2] = {bb, g_pass.copy};
@@ -1077,12 +1091,14 @@ bool RunGradedPass(command_queue* queue, swapchain* sc, float paperWhite, float 
         cmd->barrier(2, res, from, to);
     }
     cmd->bind_pipeline(pipeline_stage::all_graphics, g_pass.pipe);
-    const float params[4] = {paperWhite, peak, 0.6f, 2.2f};  // knee 0.6, gamma 2.2 decode
-    cmd->push_constants(shader_stage::pixel, g_pass.layout, 0, 0, 4, params);
+    // knee 0.6, gamma 2.2 decode, UI mask, debug view (Advanced tab)
+    const float params[8] = {paperWhite, peak, 0.6f, 2.2f, uiMask ? 1.0f : 0.0f, static_cast<float>(g_hdrDebugView), 0, 0};
+    cmd->push_constants(shader_stage::pixel, g_pass.layout, 0, 0, 8, params);
+    const resource_view views[2] = {g_pass.copyView, g_pass.sceneView};
     descriptor_table_update update = {};
-    update.count = 1;
+    update.count = 2;
     update.type = descriptor_type::shader_resource_view;
-    update.descriptors = &g_pass.copyView;
+    update.descriptors = views;
     cmd->push_descriptors(shader_stage::pixel, g_pass.layout, 1, update);
     const viewport vp = {0, 0, static_cast<float>(desc.texture.width), static_cast<float>(desc.texture.height), 0, 1};
     cmd->bind_viewports(0, 1, &vp);
@@ -1095,7 +1111,71 @@ bool RunGradedPass(command_queue* queue, swapchain* sc, float paperWhite, float 
         cmd->barrier(1, &bb, &from, &to);
     }
     queue->flush_immediate_command_list();
+    g_inPass = false;
     return true;
+}
+
+// ---------------------------------------------------------------- UI split
+//
+// Unreal draws each frame's picture into the back buffer with one full-screen draw (the
+// tonemapper/upscale), then its UI with Slate on top: seen in Life is Strange 2 (UE 4.16, draw
+// logs in LiS2Tweaks), to be confirmed here with the Advanced tab's draw log. So the first draw
+// into a back buffer each frame is the scene and any later one is UI: right before the second,
+// the back buffer is copied into g_pass.scene. At present the HDR pass compares the frame with
+// that copy and keeps UI pixels at paper white. A frame without UI draws gets no copy and is
+// stretched everywhere, as before.
+
+constexpr int kMaxBackBuffers = 4;
+std::atomic<uint64_t> g_backBuffers[kMaxBackBuffers] = {};  // the swap chain's buffers
+std::atomic<uint64_t> g_uiBoundBackBuffer{0};               // back buffer bound as target 0, or 0
+std::atomic<int> g_uiBackBufferDraws{0};                    // draws into back buffers this frame
+std::atomic<uint64_t> g_uiSnapshotOf{0};                    // back buffer copied this frame, or 0
+std::atomic<uint64_t> g_uiFramesWithUi{0}, g_uiFrames{0};   // for the Advanced tab
+
+bool IsBackBuffer(uint64_t handle) {
+    if (!handle) return false;
+    for (auto& b : g_backBuffers)
+        if (b.load() == handle) return true;
+    return false;
+}
+
+void UiNoteBackBuffers(swapchain* sc) {
+    const uint32_t n = std::min<uint32_t>(sc->get_back_buffer_count(), kMaxBackBuffers);
+    for (uint32_t i = 0; i < kMaxBackBuffers; ++i) g_backBuffers[i] = i < n ? sc->get_back_buffer(i).handle : 0;
+}
+
+void UiOnBindRenderTargets(command_list* cmd, uint32_t count, const resource_view* rtvs) {
+    if (g_inPass) return;
+    uint64_t bb = 0;
+    if (g_gradedActive && count && rtvs[0].handle) {
+        const resource r = cmd->get_device()->get_resource_from_view(rtvs[0]);
+        if (IsBackBuffer(r.handle)) bb = r.handle;
+    }
+    g_uiBoundBackBuffer = bb;
+}
+
+// Before each draw: on the frame's second draw into a back buffer (its first UI draw), copy it.
+void UiOnDraw(command_list* cmd) {
+    const uint64_t bb = g_uiBoundBackBuffer.load();
+    if (g_inPass || !bb || !g_gradedActive || !g_pass.scene.handle || g_pass.dev != cmd->get_device()) return;
+    if (++g_uiBackBufferDraws != 2 || g_uiSnapshotOf.load()) return;
+    const resource back = {bb};
+    {
+        const resource res[2] = {back, g_pass.scene};
+        const resource_usage from[2] = {resource_usage::render_target, resource_usage::shader_resource_pixel};
+        const resource_usage to[2] = {resource_usage::copy_source, resource_usage::copy_dest};
+        cmd->barrier(2, res, from, to);
+    }
+    cmd->copy_resource(back, g_pass.scene);
+    {
+        const resource res[2] = {back, g_pass.scene};
+        const resource_usage from[2] = {resource_usage::copy_source, resource_usage::copy_dest};
+        const resource_usage to[2] = {resource_usage::render_target, resource_usage::shader_resource_pixel};
+        cmd->barrier(2, res, from, to);
+    }
+    g_uiSnapshotOf = bb;
+    static std::atomic<int> logged{0};
+    if (logged++ < 6) Log("HDR UI: copied back buffer %016llx before draw 2 (thread %lu)", static_cast<unsigned long long>(bb), GetCurrentThreadId());
 }
 
 // The display's peak brightness as Windows reports it (DXGI_OUTPUT_DESC1), or 0.
@@ -1144,8 +1224,22 @@ void HdrOnPresent(command_queue* queue, swapchain* sc) {
     if (want) {
         const float paper = static_cast<float>(g_hdrPaper);
         const float peak = static_cast<float>(std::max(g_hdrPeak, g_hdrPaper));
-        ran = RunGradedPass(queue, sc, paper, peak);
+        const uint64_t presented = sc->get_current_back_buffer().handle;
+        const bool ui = g_uiSnapshotOf.load() != 0 && g_uiSnapshotOf.load() == presented;
+        static int logged = 0;
+        if (g_uiSnapshotOf.load() && logged++ < 6)
+            Log("HDR UI: present of %016llx (thread %lu): copy of %016llx, %d back buffer draws -> mask %s",
+                static_cast<unsigned long long>(presented), GetCurrentThreadId(),
+                static_cast<unsigned long long>(g_uiSnapshotOf.load()), g_uiBackBufferDraws.load(), ui ? "on" : "off");
+        ran = RunGradedPass(queue, sc, paper, peak, ui);
+        ++g_uiFrames;
+        if (ui) ++g_uiFramesWithUi;
     }
+    // The next frame starts: no back buffer drawn yet, no copy.
+    g_uiBackBufferDraws = 0;
+    g_uiSnapshotOf = 0;
+    g_uiBoundBackBuffer = 0;
+    UiNoteBackBuffers(sc);
     if (ran && (!g_gradedActive || g_colorSpaceDirty)) {
         const bool ok = SetSwapchainColorSpace(sc, DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
         if (g_runtime) g_runtime->set_color_space(color_space::hdr10_pq);
@@ -1192,7 +1286,170 @@ void LiveOnPresent() {
     std::thread(FindManager).detach();
 }
 
+// ---------------------------------------------------------------- draw log (diagnostics)
+//
+// Logs one frame's work on the back buffer: render target binds, clears, copies and draws while
+// the back buffer is bound (vertex/index counts, pixel shader handle), to find where the game's
+// picture ends and its UI begins (see the UI split above). Started from the Advanced tab.
+
+std::mutex g_drawLogMutex;
+resource g_backBuffer = {0};          // the back buffer of the frame being drawn
+std::map<uint64_t, bool> g_rtvIsBackBuffer;
+std::atomic<bool> g_drawLogArmed{false};  // log the next frame
+bool g_drawLogging = false;               // logging this frame
+bool g_backBufferBound = false;
+uint64_t g_pixelShader = 0;
+int g_drawLogLines = 0, g_drawsElsewhere = 0, g_drawSeq = 0;
+FILE* g_drawLog = nullptr;
+
+void DrawLog(const char* fmt, ...) {
+    if (!g_drawLog || g_drawLogLines >= 400) return;
+    ++g_drawLogLines;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(g_drawLog, fmt, ap);
+    va_end(ap);
+    fputc('\n', g_drawLog);
+}
+
+bool IsBackBufferView(device* dev, resource_view rtv) {
+    if (!rtv.handle || !g_backBuffer.handle) return false;
+    auto it = g_rtvIsBackBuffer.find(rtv.handle);
+    if (it != g_rtvIsBackBuffer.end()) return it->second;
+    const bool bb = IsBackBuffer(dev->get_resource_from_view(rtv).handle);
+    g_rtvIsBackBuffer[rtv.handle] = bb;
+    return bb;
+}
+
+uint32_t g_bbWidth = 0, g_bbHeight = 0;
+uint64_t g_boundTarget = 0;  // resource of render target 0 while it's screen-sized, else 0
+
+void OnBindRenderTargets(command_list* cmd, uint32_t count, const resource_view* rtvs, resource_view) {
+    UiOnBindRenderTargets(cmd, count, rtvs);
+    if (!g_drawLogging) return;
+    std::lock_guard<std::mutex> lock(g_drawLogMutex);
+    device* dev = cmd->get_device();
+    bool bb = false;
+    for (uint32_t i = 0; i < count; ++i) bb |= IsBackBufferView(dev, rtvs[i]);
+    uint64_t target = 0;
+    resource_desc d = {};
+    if (g_drawLogging && count && rtvs[0].handle) {
+        const resource r = dev->get_resource_from_view(rtvs[0]);
+        if (r.handle) {
+            d = dev->get_resource_desc(r);
+            if (d.texture.width == g_bbWidth && d.texture.height == g_bbHeight) target = r.handle;
+        }
+    }
+    // Screen-sized targets (or the back buffer) are logged with their draws; everything else is
+    // only counted.
+    const bool shown = bb || target;
+    if (g_drawLogging && (shown || g_boundTarget || g_backBufferBound) && (target != g_boundTarget || bb != g_backBufferBound)) {
+        if (shown)
+            DrawLog("%5d  render target %016llx%s %ux%u format %u (%u bound; %d draws elsewhere before)", g_drawSeq,
+                    static_cast<unsigned long long>(target), bb ? " = BACK BUFFER" : "", d.texture.width,
+                    d.texture.height, static_cast<uint32_t>(d.texture.format), count, g_drawsElsewhere);
+        else
+            DrawLog("%5d  render target: smaller/other", g_drawSeq);
+        g_drawsElsewhere = 0;
+    }
+    g_boundTarget = target;
+    g_backBufferBound = bb || target;
+}
+
+void OnBindPipeline(command_list*, pipeline_stage stages, pipeline p) {
+    if ((stages & pipeline_stage::pixel_shader) == pipeline_stage::pixel_shader) g_pixelShader = p.handle;
+}
+
+void LogDraw(const char* kind, uint32_t count, uint32_t instances) {
+    std::lock_guard<std::mutex> lock(g_drawLogMutex);
+    ++g_drawSeq;
+    if (!g_drawLogging) return;
+    if (!g_backBufferBound) {
+        ++g_drawsElsewhere;
+        return;
+    }
+    DrawLog("%5d    %s %u x%u  ps %016llx", g_drawSeq, kind, count, instances,
+            static_cast<unsigned long long>(g_pixelShader));
+}
+
+bool OnDraw(command_list* cmd, uint32_t vertices, uint32_t instances, uint32_t, uint32_t) {
+    UiOnDraw(cmd);
+    if (g_drawLogging) LogDraw("draw", vertices, instances);
+    return false;
+}
+
+bool OnDrawIndexed(command_list* cmd, uint32_t indices, uint32_t instances, uint32_t, int32_t, uint32_t) {
+    UiOnDraw(cmd);
+    if (g_drawLogging) LogDraw("draw_indexed", indices, instances);
+    return false;
+}
+
+bool OnResolve(command_list*, resource src, uint32_t, const subresource_box*, resource dst, uint32_t, uint32_t,
+               uint32_t, uint32_t, format) {
+    std::lock_guard<std::mutex> lock(g_drawLogMutex);
+    if (g_drawLogging)
+        DrawLog("%5d  resolve %016llx -> %016llx%s", g_drawSeq, static_cast<unsigned long long>(src.handle),
+                static_cast<unsigned long long>(dst.handle), dst.handle == g_backBuffer.handle ? " (BACK BUFFER)" : "");
+    return false;
+}
+
+bool OnClearRtv(command_list* cmd, resource_view rtv, const float c[4], uint32_t, const rect*) {
+    std::lock_guard<std::mutex> lock(g_drawLogMutex);
+    if (g_drawLogging && IsBackBufferView(cmd->get_device(), rtv))
+        DrawLog("%5d  clear BACK BUFFER to %.2f %.2f %.2f %.2f", g_drawSeq, c[0], c[1], c[2], c[3]);
+    return false;
+}
+
+bool OnCopyResource(command_list*, resource src, resource dst) {
+    std::lock_guard<std::mutex> lock(g_drawLogMutex);
+    if (g_drawLogging)
+        DrawLog("%5d  copy_resource %016llx -> %016llx%s", g_drawSeq, static_cast<unsigned long long>(src.handle),
+                static_cast<unsigned long long>(dst.handle), dst.handle == g_backBuffer.handle ? " (BACK BUFFER)" : "");
+    return false;
+}
+
+bool OnCopyRegion(command_list*, resource src, uint32_t, const subresource_box*, resource dst, uint32_t,
+                  const subresource_box*, filter_mode) {
+    std::lock_guard<std::mutex> lock(g_drawLogMutex);
+    if (g_drawLogging)
+        DrawLog("%5d  copy_texture_region %016llx -> %016llx%s", g_drawSeq, static_cast<unsigned long long>(src.handle),
+                static_cast<unsigned long long>(dst.handle), dst.handle == g_backBuffer.handle ? " (BACK BUFFER)" : "");
+    return false;
+}
+
+// At each present: end the logged frame, start one if asked, note the next frame's back buffer.
+void DrawLogOnPresent(swapchain* sc) {
+    std::lock_guard<std::mutex> lock(g_drawLogMutex);
+    if (g_drawLogging) {
+        DrawLog("%5d  present (%d draws elsewhere at the end)", g_drawSeq, g_drawsElsewhere);
+        fclose(g_drawLog);
+        g_drawLog = nullptr;
+        g_drawLogging = false;
+        Log("draw log: %d lines written to " DT_PRODUCT "-draws.txt", g_drawLogLines);
+    }
+    const resource bb = sc->get_current_back_buffer();
+    if (bb.handle != g_backBuffer.handle) g_rtvIsBackBuffer.clear();
+    g_backBuffer = bb;
+    const resource_desc bd = sc->get_device()->get_resource_desc(bb);
+    g_bbWidth = bd.texture.width, g_bbHeight = bd.texture.height;
+    if (g_drawLogArmed.exchange(false)) {
+        g_drawLog = _wfopen((g_exeDir + DT_PRODUCT_W L"-draws.txt").c_str(), L"a");
+        if (g_drawLog) {
+            SYSTEMTIME t;
+            GetLocalTime(&t);
+            fprintf(g_drawLog, "\n==== frame %02u:%02u:%02u, HDR %s, back buffer %016llx %ux%u format %u\n", t.wHour,
+                    t.wMinute, t.wSecond, g_gradedActive ? "on" : "off", static_cast<unsigned long long>(bb.handle),
+                    bd.texture.width, bd.texture.height, static_cast<uint32_t>(bd.texture.format));
+            g_drawLogging = true;
+            g_drawLogLines = 0;
+            g_drawSeq = 0;
+            g_drawsElsewhere = 0;
+        }
+    }
+}
+
 void OnPresent(command_queue* queue, swapchain* sc, const rect*, const rect*, uint32_t, const rect*) {
+    DrawLogOnPresent(sc);
     const int api = static_cast<int>(sc->get_device()->get_api());
     if (g_api.exchange(api) != api) Log("presenting on %s", ApiName());
     if (sc->get_color_space() != g_colorSpace) {
@@ -1360,6 +1617,16 @@ void DrawAdvanced(const View& view) {
     ImGui::TextDisabled("Graphics API: %s", ApiName());
     ImGui::TextDisabled("HDR: %s (swap chain %s)", g_hdrStatus.c_str(),
                         g_colorSpace == color_space::hdr10_pq ? "HDR10" : g_colorSpace == color_space::srgb ? "sRGB" : "other");
+    if (g_gradedActive) {
+        ImGui::TextDisabled("HDR UI kept at paper white in %llu of %llu frames so far",
+                            static_cast<unsigned long long>(g_uiFramesWithUi.load()),
+                            static_cast<unsigned long long>(g_uiFrames.load()));
+        ImGui::SetNextItemWidth(ControlWidth());
+        const char* views[] = {"Off", "Tint what counts as UI", "Show the picture before UI"};
+        ImGui::Combo("HDR debug view", &g_hdrDebugView, views, 3);
+        Help("For diagnosing HDR. Tint: pixels the add-on keeps at paper white as UI turn\n"
+             "magenta. Picture before UI: shows the copy taken just before the UI is drawn.");
+    }
     ImGui::TextDisabled("Log: " DT_PRODUCT ".log next to the game's exe");
     if (live != Live::Ready) return;
 
@@ -1369,6 +1636,10 @@ void DrawAdvanced(const View& view) {
          "setting to " DT_PRODUCT "-probe.txt next to the game's exe.\n"
          "Do it in a scene (not a menu) for the values the game really plays with.");
     if (!view.probeResult.empty()) ImGui::TextDisabled("%s", view.probeResult.c_str());
+    if (ImGui::Button("Log one frame's drawing")) g_drawLogArmed = true;
+    Help("For diagnosing HDR: writes the next frame's render target changes and draw calls on\n"
+         "the screen image to " DT_PRODUCT "-draws.txt next to the game's exe. ReShade's own\n"
+         "overlay isn't included.");
 
     ImGui::SeparatorText("Console variable");
     ImGui::SetNextItemWidth(ControlWidth() * 1.6f);
@@ -1557,6 +1828,14 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
             reshade::register_event<reshade::addon_event::destroy_effect_runtime>(&OnDestroyRuntime);
             reshade::register_event<reshade::addon_event::destroy_swapchain>(&OnDestroySwapchain);
             reshade::register_event<reshade::addon_event::destroy_device>(&OnDestroyDevice);
+            reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(&OnBindRenderTargets);
+            reshade::register_event<reshade::addon_event::bind_pipeline>(&OnBindPipeline);
+            reshade::register_event<reshade::addon_event::draw>(&OnDraw);
+            reshade::register_event<reshade::addon_event::draw_indexed>(&OnDrawIndexed);
+            reshade::register_event<reshade::addon_event::clear_render_target_view>(&OnClearRtv);
+            reshade::register_event<reshade::addon_event::copy_resource>(&OnCopyResource);
+            reshade::register_event<reshade::addon_event::copy_texture_region>(&OnCopyRegion);
+            reshade::register_event<reshade::addon_event::resolve_texture_region>(&OnResolve);
             reshade::register_event<reshade::addon_event::reshade_open_overlay>(&OnOpenOverlay);
             reshade::register_event<reshade::addon_event::reshade_overlay>(&DrawWindow);
             reshade::register_overlay(nullptr, &DrawSettings);
