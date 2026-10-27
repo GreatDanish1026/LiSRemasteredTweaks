@@ -75,9 +75,24 @@ The game's values in a scene (the 5 s and 60 s probes are identical):
 
 ## HDR
 
-On DirectX 12, setting r.HDR.EnableHDROutput=1, OutputDevice 3|4, ColorGamut 2 on the game thread
-makes the engine switch the swap chain to HDR10 PQ itself within about 0.2 s, and back to sRGB
-when the option goes off (log 2026-10-27 14:11). The add-on's SetColorSpace1 fallback isn't used.
+Unreal's HDR (offered in 0.1.0, removed in 0.2.0): on DirectX 12, setting r.HDR.EnableHDROutput=1, OutputDevice 3|4, ColorGamut 2 on
+the game thread makes the engine switch the swap chain to HDR10 PQ itself within about 0.2 s, and
+back to sRGB when the option goes off (log 2026-10-27 14:11).
+
+But it loses the game's look. Screenshots of the title screen (2026-10-27 14:17, SDR vs HDR,
+the HDR one decoded from PQ and exposure-matched): colour balance per unit luminance R/G/B
+1.38/0.91/0.81 in SDR vs 1.18/0.95/0.99 in HDR, mean saturation 0.54 vs 0.42, the darkest 2% of
+the picture 3.4x brighter, mid-tones within 5%. The HDR path swaps the game's tone curve for
+ACES and apparently skips its colour grading LUT (not confirmed in code).
+
+Graded HDR (the HDR tab since 0.2.0): the game stays in SDR; its back buffer is
+R10G10B10A2_UNORM anyway (ReShade.log). At each present, before ReShade's effects and overlay,
+the add-on copies the frame and draws it back through src/hdr.hlsl (gamma 2.2 decode, paper
+white, highlight stretch above 0.6 of SDR white towards the peak, Rec. 2020, PQ), sets the swap
+chain to HDR10 with SetColorSpace1 and tells ReShade (effect_runtime::set_color_space). First
+run 2026-10-27 14:30: pipeline built on DirectX 12 at 3840x2160, switching between modes clean,
+the display reports 3700 nits (DXGI_OUTPUT_DESC1). The user's verdict: looks good. UI is in the
+same image, so pure white text goes to the peak too.
 
 ## Preset costs
 

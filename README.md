@@ -1,11 +1,14 @@
-# LiSRemasteredTweaks 0.1.0
+# LiSRemasteredTweaks 0.2.0
 
 Graphics add-on for **Life is Strange Remastered** (PC, Steam), for ReShade with add-on support.
 Raises the game's lighting, shadow and detail settings beyond what its menu offers and adds HDR
 output, live, from an in-game overlay.
 
-- **HDR**: the game's menu has no HDR option. The HDR tab turns on the engine's own HDR10 output
-  (1000 or 2000 nits), on DirectX 11 or 12. Windows HDR must be on.
+- **HDR**: the game's menu has no HDR option. The HDR tab keeps Deck Nine's colour grade: the
+  game renders as usual and the add-on turns the finished picture into HDR10, stretching only
+  the brightest parts, with **Peak brightness** and **Paper white** sliders (and a button that
+  uses the peak Windows reports for your display). Windows HDR must be on. Unreal's own HDR
+  output isn't offered: it drops the grade (cooler, paler, lifted shadows).
 - **Lighting**: reflections on rougher surfaces, finer lighting on translucent effects. The
   menu's highest setting already maxes reflection quality, ambient occlusion and volumetric fog.
 - **Shadows**: 4096 / 8192 shadow maps, longer shadow distance, contact-hardening shadows,

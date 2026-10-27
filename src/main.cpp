@@ -28,7 +28,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <dxgi1_4.h>
+#include <dxgi1_6.h>
 
 #define ImTextureID ImU64
 #include <imgui.h>
@@ -50,6 +50,8 @@
 #include <vector>
 
 #include "cvars.hpp"
+#include "hdr_ps.h"  // built from src/hdr.hlsl by build.ps1
+#include "hdr_vs.h"
 #include "version.h"
 
 extern "C" __declspec(dllexport) const char* NAME = DT_PRODUCT;
@@ -143,20 +145,22 @@ struct Option {
 constexpr const char* kPostTab = "Post-processing";  // taste: in no preset, not measured
 constexpr const char* kHdrTab = "HDR";               // in no preset, not measured
 
+// Graded HDR's sliders (ReShade.ini HdrPeak, HdrPaperWhite), in nits.
+constexpr int kPeakMin = 400, kPeakMax = 4000, kPaperMin = 80, kPaperMax = 400;
+int g_hdrPeak = 1000;
+int g_hdrPaper = 200;
+
 // Every cvar here exists in this exe (checked offline against its strings). The game's values
 // and costs are filled in from the first probe and measurements (docs/FINDINGS.md).
 std::vector<Option> g_options = {
     // ------------------------------------------------ HDR (any API; in no preset, not measured)
     {kHdrTab, "HDR output", "Hdr", "HDR",
-     "The game's menu has no HDR option. This turns on Unreal's own HDR output, on DirectX 11\n"
-     "or 12: HDR10 (PQ, Rec. 2020) tone-mapped for a 1000 or 2000 nit display. Windows HDR\n"
+     "The game's menu has no HDR option. The game renders as usual, with Deck Nine's colour\n"
+     "grade, and the add-on turns the finished picture into HDR10, stretching only the\n"
+     "brightest parts (sun, lamps, reflections) up to the peak you set below. Windows HDR\n"
      "must be on.",
-     L"r.HDR.EnableHDROutput",
-     {{"Game", 0, {}},
-      {"HDR10, 1000 nits", 1000,
-       {{L"r.HDR.EnableHDROutput", L"1"}, {L"r.HDR.Display.OutputDevice", L"3"}, {L"r.HDR.Display.ColorGamut", L"2"}}},
-      {"HDR10, 2000 nits", 2000,
-       {{L"r.HDR.EnableHDROutput", L"1"}, {L"r.HDR.Display.OutputDevice", L"4"}, {L"r.HDR.Display.ColorGamut", L"2"}}}}},
+     nullptr,
+     {{"Off (SDR)", 0, {}}, {"HDR10", 1, {}}}},
 
     // ------------------------------------------------ lighting
     {"Lighting", "Reflections", "Ssr", "Reflections on rough surfaces",
@@ -922,17 +926,198 @@ void FrameOnPresent(bool focused) {
 
 // ---------------------------------------------------------------- present
 
-// ---------------------------------------------------------------- HDR colour space
+// ---------------------------------------------------------------- HDR
 //
-// With r.HDR.EnableHDROutput the engine writes PQ (Rec. 2020) into its 10-bit back buffer and
-// should tell DXGI so (SetColorSpace1). If the swap chain still isn't HDR10 two seconds after the
-// HDR option went on (the engine may skip that step on DirectX 12), the
-// add-on sets the colour space itself, and puts sRGB back when the option goes off. ReShade
-// doesn't see a change made this way, so its own overlay may look dim while it's in effect.
+// The game stays in SDR (its back buffer is R10G10B10A2). At each present, before ReShade's
+// effects and overlay, the add-on copies the finished frame and draws it back through
+// src/hdr.hlsl: SDR -> linear at the chosen paper white, highlights stretched to the chosen
+// peak, Rec. 2020, PQ. The swap chain is set to HDR10 (DXGI SetColorSpace1), and ReShade is told
+// too (set_color_space) so its overlay and screenshots follow.
+//
+// Unreal's own HDR output (r.HDR.EnableHDROutput) isn't offered: it swaps the game's tone curve
+// for ACES and drops its colour grade (docs/FINDINGS.md).
 
-ULONGLONG g_hdrSince = 0;  // when the HDR option went on (0 = off)
-bool g_hdrOurs = false;    // we set HDR10 on the swap chain ourselves
+constexpr int kGradedHdr = 1;  // the Hdr option's "on" choice
+
 std::string g_hdrStatus = "off";
+
+effect_runtime* g_runtime = nullptr;  // ReShade's runtime for the game's swap chain
+bool g_gradedActive = false;          // the graded pass is running and the swap chain is HDR10
+bool g_colorSpaceDirty = true;        // set again after a swap chain (re)creation
+float g_displayPeak = 0;              // what the display reports (DXGI), 0 = unknown
+
+// The graded pass's GPU objects. Created on the presenting device, rebuilt when it changes; the
+// copy and the back buffer views go whenever the swap chain is resized.
+struct GradedPass {
+    device* dev = nullptr;
+    pipeline_layout layout = {0};
+    pipeline pipe = {0};
+    format pipeFormat = format::unknown;
+    resource copy = {0};
+    resource_view copyView = {0};
+    uint32_t width = 0, height = 0;
+    format copyFormat = format::unknown;
+    std::map<uint64_t, resource_view> targets;  // back buffer -> render target view
+    bool failed = false;
+} g_pass;
+
+void ReleaseTargets() {
+    device* dev = g_pass.dev;
+    if (!dev) return;
+    for (auto& [bb, rtv] : g_pass.targets) dev->destroy_resource_view(rtv);
+    g_pass.targets.clear();
+    if (g_pass.copyView.handle) dev->destroy_resource_view(g_pass.copyView);
+    if (g_pass.copy.handle) dev->destroy_resource(g_pass.copy);
+    g_pass.copyView = {0};
+    g_pass.copy = {0};
+    g_pass.width = g_pass.height = 0;
+}
+
+void ReleasePass() {
+    ReleaseTargets();
+    if (g_pass.dev) {
+        if (g_pass.pipe.handle) g_pass.dev->destroy_pipeline(g_pass.pipe);
+        if (g_pass.layout.handle) g_pass.dev->destroy_pipeline_layout(g_pass.layout);
+    }
+    g_pass = {};
+}
+
+bool CreatePipeline(device* dev, format target) {
+    pipeline_layout_param params[2];
+    params[0] = constant_range{0, 0, 0, 4, shader_stage::pixel};  // b0: 4 floats
+    params[1] = descriptor_range{0, 0, 0, 1, shader_stage::pixel, 1, descriptor_type::shader_resource_view};  // t0
+    if (!dev->create_pipeline_layout(2, params, &g_pass.layout)) return false;
+    shader_desc vs = {};
+    vs.code = kHdrVs;
+    vs.code_size = sizeof(kHdrVs);
+    shader_desc ps = {};
+    ps.code = kHdrPs;
+    ps.code_size = sizeof(kHdrPs);
+    primitive_topology topology = primitive_topology::triangle_list;
+    blend_desc blend = {};
+    rasterizer_desc raster = {};
+    raster.cull_mode = cull_mode::none;
+    depth_stencil_desc depth = {};
+    depth.depth_enable = false;
+    pipeline_subobject subobjects[] = {
+        {pipeline_subobject_type::vertex_shader, 1, &vs},
+        {pipeline_subobject_type::pixel_shader, 1, &ps},
+        {pipeline_subobject_type::render_target_formats, 1, &target},
+        {pipeline_subobject_type::primitive_topology, 1, &topology},
+        {pipeline_subobject_type::blend_state, 1, &blend},
+        {pipeline_subobject_type::rasterizer_state, 1, &raster},
+        {pipeline_subobject_type::depth_stencil_state, 1, &depth},
+    };
+    if (!dev->create_pipeline(g_pass.layout, 7, subobjects, &g_pass.pipe)) return false;
+    g_pass.pipeFormat = target;
+    return true;
+}
+
+// The copy of the frame and a render target view of <bb>, (re)made as needed.
+bool EnsureTargets(device* dev, resource bb, const resource_desc& desc, resource_view* rtv) {
+    const uint32_t w = desc.texture.width, h = desc.texture.height;
+    const format f = desc.texture.format;
+    if (!g_pass.copy.handle || g_pass.width != w || g_pass.height != h || g_pass.copyFormat != f) {
+        ReleaseTargets();
+        resource_desc cd(w, h, 1, 1, f, 1, memory_heap::default_, resource_usage::copy_dest | resource_usage::shader_resource);
+        if (!dev->create_resource(cd, nullptr, resource_usage::shader_resource_pixel, &g_pass.copy)) return false;
+        if (!dev->create_resource_view(g_pass.copy, resource_usage::shader_resource, resource_view_desc(f), &g_pass.copyView))
+            return false;
+        g_pass.width = w, g_pass.height = h, g_pass.copyFormat = f;
+    }
+    auto it = g_pass.targets.find(bb.handle);
+    if (it == g_pass.targets.end()) {
+        resource_view v = {0};
+        if (!dev->create_resource_view(bb, resource_usage::render_target, resource_view_desc(f), &v)) return false;
+        it = g_pass.targets.emplace(bb.handle, v).first;
+    }
+    *rtv = it->second;
+    return true;
+}
+
+// Draws the frame back into the back buffer as HDR10. Present thread, before ReShade's own work.
+bool RunGradedPass(command_queue* queue, swapchain* sc, float paperWhite, float peak) {
+    device* dev = sc->get_device();
+    const resource bb = sc->get_current_back_buffer();
+    const resource_desc desc = dev->get_resource_desc(bb);
+    if (g_pass.dev != dev) {
+        ReleasePass();
+        g_pass.dev = dev;
+    }
+    if (g_pass.failed) return false;
+    if (!g_pass.pipe.handle || g_pass.pipeFormat != desc.texture.format) {
+        if (g_pass.pipe.handle) dev->destroy_pipeline(g_pass.pipe), g_pass.pipe = {0};
+        if (g_pass.layout.handle) dev->destroy_pipeline_layout(g_pass.layout), g_pass.layout = {0};
+        if (!CreatePipeline(dev, desc.texture.format)) {
+            Log("graded HDR: couldn't create the pipeline");
+            g_pass.failed = true;
+            return false;
+        }
+        Log("graded HDR: pipeline ready (%s, back buffer %ux%u, format %u)", ApiName(), desc.texture.width,
+            desc.texture.height, static_cast<uint32_t>(desc.texture.format));
+    }
+    resource_view rtv = {0};
+    if (!EnsureTargets(dev, bb, desc, &rtv)) {
+        Log("graded HDR: couldn't create the frame copy or the back buffer view");
+        g_pass.failed = true;
+        return false;
+    }
+    command_list* cmd = queue->get_immediate_command_list();
+    {
+        const resource res[2] = {bb, g_pass.copy};
+        const resource_usage from[2] = {resource_usage::present, resource_usage::shader_resource_pixel};
+        const resource_usage to[2] = {resource_usage::copy_source, resource_usage::copy_dest};
+        cmd->barrier(2, res, from, to);
+    }
+    cmd->copy_resource(bb, g_pass.copy);
+    {
+        const resource res[2] = {bb, g_pass.copy};
+        const resource_usage from[2] = {resource_usage::copy_source, resource_usage::copy_dest};
+        const resource_usage to[2] = {resource_usage::render_target, resource_usage::shader_resource_pixel};
+        cmd->barrier(2, res, from, to);
+    }
+    cmd->bind_pipeline(pipeline_stage::all_graphics, g_pass.pipe);
+    const float params[4] = {paperWhite, peak, 0.6f, 2.2f};  // knee 0.6, gamma 2.2 decode
+    cmd->push_constants(shader_stage::pixel, g_pass.layout, 0, 0, 4, params);
+    descriptor_table_update update = {};
+    update.count = 1;
+    update.type = descriptor_type::shader_resource_view;
+    update.descriptors = &g_pass.copyView;
+    cmd->push_descriptors(shader_stage::pixel, g_pass.layout, 1, update);
+    const viewport vp = {0, 0, static_cast<float>(desc.texture.width), static_cast<float>(desc.texture.height), 0, 1};
+    cmd->bind_viewports(0, 1, &vp);
+    const rect scissor = {0, 0, static_cast<int32_t>(desc.texture.width), static_cast<int32_t>(desc.texture.height)};
+    cmd->bind_scissor_rects(0, 1, &scissor);
+    cmd->bind_render_targets_and_depth_stencil(1, &rtv);
+    cmd->draw(3, 1, 0, 0);
+    {
+        const resource_usage from = resource_usage::render_target, to = resource_usage::present;
+        cmd->barrier(1, &bb, &from, &to);
+    }
+    queue->flush_immediate_command_list();
+    return true;
+}
+
+// The display's peak brightness as Windows reports it (DXGI_OUTPUT_DESC1), or 0.
+float QueryDisplayPeak(swapchain* sc) {
+    auto native = reinterpret_cast<IUnknown*>(sc->get_native());
+    IDXGISwapChain* chain = nullptr;
+    float peak = 0;
+    if (native && SUCCEEDED(native->QueryInterface(IID_PPV_ARGS(&chain))) && chain) {
+        IDXGIOutput* output = nullptr;
+        if (SUCCEEDED(chain->GetContainingOutput(&output)) && output) {
+            IDXGIOutput6* output6 = nullptr;
+            if (SUCCEEDED(output->QueryInterface(IID_PPV_ARGS(&output6))) && output6) {
+                DXGI_OUTPUT_DESC1 d = {};
+                if (SUCCEEDED(output6->GetDesc1(&d))) peak = d.MaxLuminance;
+                output6->Release();
+            }
+            output->Release();
+        }
+        chain->Release();
+    }
+    return peak;
+}
 
 bool SetSwapchainColorSpace(swapchain* sc, DXGI_COLOR_SPACE_TYPE cs) {
     auto native = reinterpret_cast<IUnknown*>(sc->get_native());
@@ -945,43 +1130,61 @@ bool SetSwapchainColorSpace(swapchain* sc, DXGI_COLOR_SPACE_TYPE cs) {
     return ok;
 }
 
-void HdrOnPresent(swapchain* sc) {
+// Every frame: the pass while HDR is wanted, and the colour space switched to match.
+void HdrOnPresent(command_queue* queue, swapchain* sc) {
     const Option* o = FindOption("Hdr");
-    const bool want = o && o->value && g_enabled && g_live.load() == Live::Ready;
-    const ULONGLONG now = GetTickCount64();
-    if (!want) {
-        g_hdrSince = 0;
-        if (g_hdrOurs) {
-            const bool ok = SetSwapchainColorSpace(sc, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
-            Log("HDR off: swap chain colour space back to sRGB %s", ok ? "done" : "FAILED");
-            g_hdrOurs = false;
-        }
+    const bool want = o && o->value == kGradedHdr && g_enabled;
+    if (want && g_displayPeak == 0) {
+        g_displayPeak = QueryDisplayPeak(sc);
+        if (g_displayPeak < 0) g_displayPeak = 0;
+        Log("display reports %.0f nits peak", g_displayPeak);
+        if (g_displayPeak == 0) g_displayPeak = -1;  // asked; don't ask every frame
+    }
+    bool ran = false;
+    if (want) {
+        const float paper = static_cast<float>(g_hdrPaper);
+        const float peak = static_cast<float>(std::max(g_hdrPeak, g_hdrPaper));
+        ran = RunGradedPass(queue, sc, paper, peak);
+    }
+    if (ran && (!g_gradedActive || g_colorSpaceDirty)) {
+        const bool ok = SetSwapchainColorSpace(sc, DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+        if (g_runtime) g_runtime->set_color_space(color_space::hdr10_pq);
+        Log("graded HDR on: swap chain HDR10 %s (paper white %d, peak %d nits)", ok ? "set" : "REFUSED", g_hdrPaper,
+            g_hdrPeak);
+        g_hdrStatus = ok ? "HDR10" : "the display refused HDR10 (is Windows HDR on?)";
+        g_gradedActive = true;
+        g_colorSpaceDirty = false;
+    } else if (!ran && g_gradedActive) {
+        const bool ok = SetSwapchainColorSpace(sc, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+        if (g_runtime) g_runtime->set_color_space(color_space::srgb);
+        Log("graded HDR off: swap chain back to sRGB %s", ok ? "done" : "FAILED");
+        g_gradedActive = false;
         g_hdrStatus = "off";
-        return;
     }
-    if (!g_hdrSince) g_hdrSince = now;
-    if (sc->get_color_space() == color_space::hdr10_pq && !g_hdrOurs) {
-        g_hdrStatus = "HDR10, set by the game";
-        return;
-    }
-    if (g_hdrOurs || now < g_hdrSince + 2000) return;
-    const format f = sc->get_device()->get_resource_desc(sc->get_current_back_buffer()).texture.format;
-    if (f != format::r10g10b10a2_unorm && f != format::b10g10r10a2_unorm) {
-        static format logged = format::unknown;
-        if (logged != f) Log("HDR: back buffer is format %u, not 10-bit; can't switch it to HDR10", static_cast<uint32_t>(f));
-        logged = f;
-        g_hdrStatus = "not possible: the back buffer isn't 10-bit";
-        return;
-    }
-    g_hdrOurs = SetSwapchainColorSpace(sc, DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
-    Log("HDR: the game left the swap chain in %s; set HDR10 ourselves: %s",
-        sc->get_color_space() == color_space::srgb ? "sRGB" : "another colour space", g_hdrOurs ? "done" : "FAILED");
-    g_hdrStatus = g_hdrOurs ? "HDR10, set by " DT_PRODUCT : "the display refused HDR10 (is Windows HDR on?)";
-    if (!g_hdrOurs) g_hdrSince = now + 60000;  // try again in a minute
+    if (want && !ran) g_hdrStatus = "HDR failed (see the log)";
 }
 
 color_space g_colorSpace = color_space::unknown;
 bool g_keyWasDown = false;
+
+void OnInitRuntime(effect_runtime* runtime) {
+    g_runtime = runtime;
+    g_colorSpaceDirty = true;
+}
+
+void OnDestroyRuntime(effect_runtime* runtime) {
+    if (g_runtime == runtime) g_runtime = nullptr;
+}
+
+// A resize or re-creation: the back buffers and their views go away; the colour space is set again.
+void OnDestroySwapchain(swapchain* sc, bool) {
+    if (g_pass.dev == sc->get_device()) ReleaseTargets();
+    g_colorSpaceDirty = true;
+}
+
+void OnDestroyDevice(device* dev) {
+    if (g_pass.dev == dev) ReleasePass();
+}
 
 void LiveOnPresent() {
     if (g_live.load() != Live::Idle) return;
@@ -989,7 +1192,7 @@ void LiveOnPresent() {
     std::thread(FindManager).detach();
 }
 
-void OnPresent(command_queue*, swapchain* sc, const rect*, const rect*, uint32_t, const rect*) {
+void OnPresent(command_queue* queue, swapchain* sc, const rect*, const rect*, uint32_t, const rect*) {
     const int api = static_cast<int>(sc->get_device()->get_api());
     if (g_api.exchange(api) != api) Log("presenting on %s", ApiName());
     if (sc->get_color_space() != g_colorSpace) {
@@ -1013,7 +1216,7 @@ void OnPresent(command_queue*, swapchain* sc, const rect*, const rect*, uint32_t
     g_keyWasDown = down;
     FrameOnPresent(focused);
     LiveOnPresent();
-    HdrOnPresent(sc);
+    HdrOnPresent(queue, sc);
 }
 
 // ---------------------------------------------------------------- overlay
@@ -1050,7 +1253,7 @@ std::string GameValue(const View& view, const wchar_t* name) {
 }
 
 std::string ChoiceLabel(const View& view, const Option& o, const Choice& c) {
-    if (c.id != 0) return c.label;
+    if (c.id != 0 || !o.shown) return c.label;  // no game value to show: the choice's own label
     std::string v = GameValue(view, o.shown);
     return v.empty() ? "Game" : "Game (" + v + ")";
 }
@@ -1076,6 +1279,38 @@ bool DrawOption(const View& view, Option& o) {
     return changed;
 }
 
+// HDR's brightness sliders (HDR tab, while HDR10 is chosen). Saved at once;
+// the pass reads them every frame.
+void DrawHdrSliders() {
+    const Option* o = FindOption("Hdr");
+    if (!o || o->value != kGradedHdr) return;
+    ImGui::SeparatorText("Brightness");
+    bool save = false;
+    ImGui::SetNextItemWidth(ControlWidth());
+    save |= ImGui::SliderInt("Peak brightness", &g_hdrPeak, kPeakMin, kPeakMax, "%d nits", ImGuiSliderFlags_AlwaysClamp);
+    Help("How bright the brightest parts of the picture get: the sun, lamps, reflections.\n"
+         "Set it to your display's peak brightness (or a little below, for a softer look).\n"
+         "Ctrl+click to type a value.");
+    if (g_displayPeak > 0) {
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Use display's")) {
+            g_hdrPeak = std::clamp(static_cast<int>(g_displayPeak + 0.5f), kPeakMin, kPeakMax);
+            save = true;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Windows reports %.0f nits for this display.", g_displayPeak);
+    }
+    ImGui::SetNextItemWidth(ControlWidth());
+    save |= ImGui::SliderInt("Paper white", &g_hdrPaper, kPaperMin, kPaperMax, "%d nits", ImGuiSliderFlags_AlwaysClamp);
+    Help("How bright everything else is: walls, faces, the menus and subtitles. 200 is a\n"
+         "common choice; raise it in a bright room, lower it in a dark one.");
+    if (g_hdrPeak < g_hdrPaper) ImGui::TextColored(kWarn, "Peak is below paper white: highlights aren't stretched.");
+    if (save) {
+        reshade::set_config_value(nullptr, DT_PRODUCT, "HdrPeak", g_hdrPeak);
+        reshade::set_config_value(nullptr, DT_PRODUCT, "HdrPaperWhite", g_hdrPaper);
+        Log("graded HDR: peak %d, paper white %d nits", g_hdrPeak, g_hdrPaper);
+    }
+}
+
 bool DrawTab(const View& view, const char* tab) {
     bool changed = false;
     const char* section = nullptr;
@@ -1087,6 +1322,7 @@ bool DrawTab(const View& view, const char* tab) {
         }
         changed |= DrawOption(view, o);
     }
+    if (!strcmp(tab, kHdrTab)) DrawHdrSliders();
     ImGui::Spacing();
     bool any = false;
     for (const Option& o : g_options) any |= !strcmp(o.tab, tab) && o.value != 0;
@@ -1312,7 +1548,15 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
             OpenLog();
             LoadSettings();
             reshade::get_config_value(nullptr, DT_PRODUCT, "ShowWindow", g_showWindow);
+            reshade::get_config_value(nullptr, DT_PRODUCT, "HdrPeak", g_hdrPeak);
+            reshade::get_config_value(nullptr, DT_PRODUCT, "HdrPaperWhite", g_hdrPaper);
+            g_hdrPeak = std::clamp(g_hdrPeak, kPeakMin, kPeakMax);
+            g_hdrPaper = std::clamp(g_hdrPaper, kPaperMin, kPaperMax);
             reshade::register_event<reshade::addon_event::present>(&OnPresent);
+            reshade::register_event<reshade::addon_event::init_effect_runtime>(&OnInitRuntime);
+            reshade::register_event<reshade::addon_event::destroy_effect_runtime>(&OnDestroyRuntime);
+            reshade::register_event<reshade::addon_event::destroy_swapchain>(&OnDestroySwapchain);
+            reshade::register_event<reshade::addon_event::destroy_device>(&OnDestroyDevice);
             reshade::register_event<reshade::addon_event::reshade_open_overlay>(&OnOpenOverlay);
             reshade::register_event<reshade::addon_event::reshade_overlay>(&DrawWindow);
             reshade::register_overlay(nullptr, &DrawSettings);

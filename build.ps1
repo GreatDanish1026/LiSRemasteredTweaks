@@ -23,11 +23,14 @@ $obj = "$root\bin\obj"
 New-Item -ItemType Directory -Force $obj | Out-Null
 $addon = "$root\bin\LiSRemasteredTweaks.addon64"
 
-# ReShade add-on headers in third_party\reshade match ReShade 6.8.0.
+# ReShade add-on headers in third_party\reshade match ReShade 6.8.0. The graded-HDR shaders
+# (src\hdr.hlsl) are compiled to DXBC headers in bin\obj with the Windows SDK's fxc.
 $cmd = @(
     "call `"$vcvars`" >nul",
+    "fxc /nologo /O3 /T vs_5_0 /E main_vs /Vn kHdrVs /Fh `"$obj\hdr_vs.h`" `"$root\src\hdr.hlsl`" >nul",
+    "fxc /nologo /O3 /T ps_5_0 /E main_ps /Vn kHdrPs /Fh `"$obj\hdr_ps.h`" `"$root\src\hdr.hlsl`" >nul",
     ("cl /nologo /std:c++17 /O2 /EHsc /MT /W3 /D_CRT_SECURE_NO_WARNINGS /DNOMINMAX " +
-     "/I `"$root\third_party\imgui`" /I `"$root\third_party\reshade\include`" " +
+     "/I `"$root\third_party\imgui`" /I `"$root\third_party\reshade\include`" /I `"$obj`" " +
      "/Fo`"$obj\\`" `"$root\src\main.cpp`" user32.lib " +
      "/link /DLL /OUT:`"$addon`" /PDB:`"$obj\LiSRemasteredTweaks.pdb`" /DEBUG")
 ) -join " && "
